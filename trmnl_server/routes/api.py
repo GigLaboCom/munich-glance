@@ -2,11 +2,12 @@
 
 import logging
 import uuid
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Header, Query, Request
 from pydantic import BaseModel
+from sqlalchemy import select
 
 from trmnl_server.config import get_config
 from trmnl_server.database import get_session
@@ -21,6 +22,14 @@ from trmnl_server.services.plugins import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["api"])
+
+# Device MAC used for readings that arrive without any identification.
+UNKNOWN_DEVICE_MAC = "UNKNOWN"
+
+# Minimum spacing between stored battery samples per device. The firmware reports
+# telemetry on every poll (~2 min); without throttling battery_readings would grow by
+# ~700 rows/day for data that only moves on an hourly scale.
+BATTERY_SAMPLE_INTERVAL_SECONDS = 900
 
 
 class DisplayResponse(BaseModel):
@@ -74,13 +83,45 @@ class LogArray(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class TerminusLogEntry(BaseModel):
+    """Single log entry in the Terminus (current firmware) format.
+
+    Field names follow usetrmnl/terminus doc/api.adoc — the payload the stock
+    firmware actually posts. Everything is optional: firmware versions differ in
+    which fields they populate.
+    """
+
+    id: int | None = None
+    message: str | None = None
+    level: str | None = None
+    source_path: str | None = None
+    source_line: int | None = None
+    created_at: int | None = None
+    firmware_version: str | None = None
+    battery_voltage: float | None = None
+    wifi_signal: int | None = None
+    wifi_status: str | None = None
+    free_heap_size: int | None = None
+    max_alloc_size: int | None = None
+    wake_reason: str | None = None
+    sleep_duration: int | None = None
+    refresh_rate: int | None = None
+    special_function: str | None = None
+    retry: int | None = None
+
+    model_config = {"extra": "allow"}
+
+
 class LogRequest(BaseModel):
     """Request body for /api/log endpoint.
 
-    Accepts the TRMNL firmware log format:
-    {"log": {"logs_array": [...]}}
+    Accepts three shapes, newest first:
+    1. Terminus / stock firmware: {"logs": [...]}
+    2. Older firmware:            {"log": {"logs_array": [...]}}
+    3. Legacy flat:               {"log_type": "...", "message": "..."}
     """
 
+    logs: list[TerminusLogEntry] | None = None
     log: LogArray | None = None
 
     # Legacy format support
@@ -124,19 +165,162 @@ class SetupResponse(BaseModel):
     message: str
 
 
-def _get_device_mac(request: Request, header_mac: str | None = None) -> str:
-    """Extract device MAC address from request."""
-    # Try header first
-    if header_mac:
-        return header_mac.upper().replace(":", "")
+def _normalize_mac(raw: str) -> str:
+    """Normalize a MAC to bare uppercase hex (AA:BB:CC -> AABBCC)."""
+    return raw.strip().upper().replace(":", "").replace("-", "")
 
-    # Try query param
-    mac = request.query_params.get("mac", "")
-    if mac:
-        return mac.upper().replace(":", "")
 
-    # Generate a unique ID for unknown devices
-    return f"UNKNOWN-{uuid.uuid4().hex[:8].upper()}"
+def _get_device_mac(request: Request, header_mac: str | None = None) -> str | None:
+    """Resolve the calling device's MAC, or None when it is unidentified.
+
+    The stock TRMNL firmware identifies itself with the ``ID`` header (see
+    usetrmnl/terminus doc/api.adoc); ``X-Device-MAC`` and ``?mac=`` are kept for
+    custom clients. Returning None instead of a random ``UNKNOWN-xxxx`` id matters:
+    the old fallback minted a fresh identity on every poll, so an anonymous device
+    registered a new row in ``devices`` every couple of minutes.
+    """
+    for raw in (header_mac, request.headers.get("ID"), request.query_params.get("mac")):
+        if raw and raw.strip():
+            return _normalize_mac(raw)
+    return None
+
+
+def _header_value(request: Request, *names: str) -> str | None:
+    """First non-empty value among the given (case-insensitive) header names."""
+    for name in names:
+        value: str | None = request.headers.get(name)
+        if value and value.strip():
+            return str(value.strip())
+    return None
+
+
+def _as_float(value: str | None) -> float | None:
+    """Parse a header value as float, tolerating junk from the firmware."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _as_int(value: str | None) -> int | None:
+    """Parse a header value as int, tolerating floats ("-69.0") and junk."""
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except ValueError:
+        return None
+
+
+class DeviceTelemetry(BaseModel):
+    """Device state reported alongside a request.
+
+    The TRMNL protocol has no battery endpoint — the firmware piggybacks battery,
+    signal and firmware version onto the headers of every /api/display call, and
+    repeats them inside /api/log entries.
+    """
+
+    voltage: float | None = None
+    rssi: int | None = None
+    firmware_version: str | None = None
+    refresh_rate: int | None = None
+
+    def has_reading(self) -> bool:
+        """True when there is a battery sample worth storing."""
+        return self.voltage is not None
+
+
+def _telemetry_from_headers(request: Request) -> DeviceTelemetry:
+    """Read telemetry headers, accepting both dash and underscore spellings."""
+    return DeviceTelemetry(
+        voltage=_as_float(_header_value(request, "Battery-Voltage", "BATTERY_VOLTAGE")),
+        rssi=_as_int(_header_value(request, "RSSI", "WIFI-RSSI")),
+        firmware_version=_header_value(request, "FW-Version", "FW_VERSION"),
+        refresh_rate=_as_int(_header_value(request, "Refresh-Rate", "REFRESH_RATE")),
+    )
+
+
+async def _raw_body_preview(request: Request, limit: int = 1000) -> str:
+    """Truncated raw request body, for diagnosing unrecognized payloads.
+
+    Safe to call after FastAPI parsed the body — Starlette caches it on the request.
+    """
+    try:
+        body = await request.body()
+    except Exception as e:  # pragma: no cover - defensive
+        return f"<unreadable body: {e}>"
+    text = bytes(body).decode("utf-8", errors="replace")
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+async def _should_sample_battery(session, mac: str) -> bool:
+    """True when the last stored reading for this device is old enough."""
+    result = await session.execute(
+        select(BatteryReading.created_at)
+        .where(BatteryReading.device_mac == mac)
+        .order_by(BatteryReading.created_at.desc())
+        .limit(1)
+    )
+    last: datetime | None = result.scalar_one_or_none()
+    if last is None:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=UTC)
+    age = (datetime.now(UTC) - last).total_seconds()
+    return bool(age >= BATTERY_SAMPLE_INTERVAL_SECONDS)
+
+
+async def _record_device_contact(
+    mac: str | None,
+    telemetry: DeviceTelemetry,
+    plugin_name: str | None = None,
+) -> None:
+    """Upsert the device row and store a throttled battery sample.
+
+    Unidentified callers are deliberately not registered — see _get_device_mac.
+    Never raises: telemetry bookkeeping must not fail a device's display request.
+    """
+    if not mac:
+        logger.debug("Unidentified request (no ID header), skipping device registration")
+        return
+
+    try:
+        async with get_session() as session:
+            result = await session.execute(select(Device).where(Device.mac_address == mac))
+            device = result.scalar_one_or_none()
+
+            if device is None:
+                device = Device(mac_address=mac, current_plugin=plugin_name)
+                session.add(device)
+                logger.info(f"Registered new device {mac}")
+
+            # UTC throughout: created_at/updated_at use the DB's func.now(), which is
+            # UTC in SQLite. Writing a local-time last_seen skewed the two by the
+            # server's UTC offset.
+            device.last_seen = datetime.now(UTC)
+            if plugin_name:
+                device.current_plugin = plugin_name
+            if telemetry.firmware_version:
+                device.firmware_version = telemetry.firmware_version
+            if telemetry.refresh_rate:
+                device.refresh_rate = telemetry.refresh_rate
+
+            if telemetry.has_reading() and await _should_sample_battery(session, mac):
+                session.add(
+                    BatteryReading(
+                        device_mac=mac,
+                        voltage=telemetry.voltage,
+                        rssi=telemetry.rssi,
+                    )
+                )
+                logger.info(
+                    f"Battery sample from {mac}: {telemetry.voltage}V rssi={telemetry.rssi}"
+                )
+
+    except Exception as e:
+        logger.warning(f"Could not record device contact for {mac}: {e}")
 
 
 def _parse_time(time_str: str) -> time:
@@ -240,6 +424,11 @@ async def get_display(
     """
     config = get_config()
     mac = _get_device_mac(request, x_device_mac)
+    plugin_name = plugin or get_primary_plugin_name()
+
+    # Record contact before any early return: a sleeping device still reports its
+    # battery, and that is the only channel the firmware has for telemetry.
+    await _record_device_contact(mac, _telemetry_from_headers(request), plugin_name=plugin_name)
 
     # Check if device should be sleeping
     if _is_in_sleep_window(config):
@@ -270,9 +459,6 @@ async def get_display(
             refresh_rate=sleep_refresh_rate,
             special_function="sleep",
         )
-
-    # Determine which plugin to use
-    plugin_name = plugin or get_primary_plugin_name()
 
     if not plugin_name:
         logger.error("No plugin available")
@@ -312,28 +498,6 @@ async def get_display(
         image_url = f"{base_url}/generated/screen.bmp?v={output.content_hash}"
         filename = f"{output.content_hash}_screen.bmp"
 
-    # Update device last seen
-    try:
-        async with get_session() as session:
-            from sqlalchemy import select
-
-            result = await session.execute(select(Device).where(Device.mac_address == mac))
-            device = result.scalar_one_or_none()
-
-            if device:
-                device.last_seen = datetime.now()
-            else:
-                # Register new device
-                device = Device(
-                    mac_address=mac,
-                    last_seen=datetime.now(),
-                    current_plugin=plugin_name,
-                )
-                session.add(device)
-
-    except Exception as e:
-        logger.warning(f"Could not update device record: {e}")
-
     logger.debug(f"Display response for {mac}: {image_url}")
 
     # Get dynamic refresh rate from plugin if available
@@ -361,20 +525,48 @@ async def post_log(
     Called by TRMNL firmware on various events like display update,
     sleep, wake, etc.
 
-    Accepts two formats:
-    1. TRMNL firmware format: {"log": {"logs_array": [...]}}
-    2. Legacy format: {"log_type": "...", "message": "..."}
+    Accepts three formats:
+    1. Terminus / stock firmware: {"logs": [...]}
+    2. Older firmware format:     {"log": {"logs_array": [...]}}
+    3. Legacy format:             {"log_type": "...", "message": "..."}
     """
     mac = _get_device_mac(request, x_device_mac)
+    telemetry = _telemetry_from_headers(request)
 
     try:
         async with get_session() as session:
-            # Handle TRMNL firmware format
-            if log_data.log and log_data.log.logs_array:
+            # Handle Terminus format (current firmware)
+            if log_data.logs:
+                for terminus_entry in log_data.logs:
+                    session.add(
+                        DeviceLog(
+                            device_mac=mac or UNKNOWN_DEVICE_MAC,
+                            log_type=terminus_entry.level
+                            or terminus_entry.source_path
+                            or "firmware",
+                            message=terminus_entry.message,
+                            firmware_version=terminus_entry.firmware_version,
+                            wifi_rssi=terminus_entry.wifi_signal,
+                            battery_voltage=terminus_entry.battery_voltage,
+                            free_heap=terminus_entry.free_heap_size,
+                        )
+                    )
+                # Headers win when present; otherwise fall back to the newest entry
+                # that carried a voltage.
+                if not telemetry.has_reading():
+                    for terminus_entry in reversed(log_data.logs):
+                        if terminus_entry.battery_voltage is not None:
+                            telemetry.voltage = terminus_entry.battery_voltage
+                            telemetry.rssi = terminus_entry.wifi_signal
+                            telemetry.firmware_version = terminus_entry.firmware_version
+                            break
+                logger.info(f"Log from {mac}: {len(log_data.logs)} entries (terminus format)")
+            # Handle older TRMNL firmware format
+            elif log_data.log and log_data.log.logs_array:
                 for entry in log_data.log.logs_array:
                     status = entry.device_status_stamp
                     log_entry = DeviceLog(
-                        device_mac=mac,
+                        device_mac=mac or UNKNOWN_DEVICE_MAC,
                         log_type=entry.log_sourcefile or "firmware",
                         message=entry.log_message,
                         firmware_version=status.current_fw_version if status else None,
@@ -383,11 +575,19 @@ async def post_log(
                         free_heap=status.free_heap_size if status else None,
                     )
                     session.add(log_entry)
-                logger.debug(f"Log from {mac}: {len(log_data.log.logs_array)} entries")
+                    if (
+                        not telemetry.has_reading()
+                        and status
+                        and status.battery_voltage is not None
+                    ):
+                        telemetry.voltage = status.battery_voltage
+                        telemetry.rssi = status.wifi_rssi_level
+                        telemetry.firmware_version = status.current_fw_version
+                logger.info(f"Log from {mac}: {len(log_data.log.logs_array)} entries")
             # Handle legacy format
             elif log_data.log_type:
                 log_entry = DeviceLog(
-                    device_mac=mac,
+                    device_mac=mac or UNKNOWN_DEVICE_MAC,
                     log_type=log_data.log_type,
                     message=log_data.message,
                     firmware_version=log_data.firmware_version,
@@ -396,14 +596,25 @@ async def post_log(
                     free_heap=log_data.free_heap,
                 )
                 session.add(log_entry)
-                logger.debug(f"Log from {mac}: {log_data.log_type}")
+                if not telemetry.has_reading() and log_data.battery_voltage is not None:
+                    telemetry.voltage = log_data.battery_voltage
+                    telemetry.rssi = log_data.wifi_rssi
+                    telemetry.firmware_version = log_data.firmware_version
+                logger.info(f"Log from {mac}: {log_data.log_type}")
             else:
-                # Accept but don't store unknown formats
-                logger.debug(f"Log from {mac}: unknown format, accepted")
+                # Accept but don't store — and say so loudly with the payload, since
+                # a silent drop here is exactly how this endpoint stored nothing for
+                # weeks while answering 200 OK.
+                logger.warning(
+                    f"Log from {mac}: unrecognized payload, nothing stored: "
+                    f"{await _raw_body_preview(request)}"
+                )
 
     except Exception as e:
         logger.error(f"Failed to save log: {e}")
         return LogResponse(status=1, message=str(e))
+
+    await _record_device_contact(mac, telemetry)
 
     return LogResponse(status=0, message="ok")
 
@@ -416,9 +627,12 @@ async def post_battery(
 ) -> BatteryResponse:
     """Record battery and RSSI readings.
 
-    Called periodically by TRMNL firmware to report battery status.
+    Note: this endpoint is a MunichGlance extension, not part of the TRMNL protocol —
+    stock firmware never calls it. Real devices report battery in the headers of
+    /api/display and inside /api/log entries, which is where the readings come from.
+    Kept for manual reporting and custom clients; writes are not throttled here.
     """
-    mac = _get_device_mac(request, x_device_mac)
+    mac = _get_device_mac(request, x_device_mac) or UNKNOWN_DEVICE_MAC
 
     try:
         async with get_session() as session:
@@ -429,7 +643,7 @@ async def post_battery(
             )
             session.add(reading)
 
-        logger.debug(f"Battery from {mac}: {battery_data.voltage}V")
+        logger.info(f"Battery from {mac}: {battery_data.voltage}V")
 
     except Exception as e:
         logger.error(f"Failed to save battery reading: {e}")
@@ -453,7 +667,8 @@ async def get_setup(
     # Generate or retrieve API key for device
     api_key = config.setup_api_key or f"mg_{uuid.uuid4().hex[:16]}"
 
-    logger.info(f"Setup request from {mac}")
+    await _record_device_contact(mac, _telemetry_from_headers(request))
+    logger.info(f"Setup request from {mac or 'unidentified device'}")
 
     return SetupResponse(
         status=0,

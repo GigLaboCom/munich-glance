@@ -23,6 +23,11 @@ server:
   # Enable debug mode for development (enables detailed error messages)
   debug: false
 
+  # Root log level: DEBUG, INFO, WARNING, ERROR
+  # DEBUG adds per-request device detail (identification, telemetry, payloads).
+  # The LOG_LEVEL environment variable overrides this.
+  log_level: "INFO"
+
   # Timezone for displaying times (IANA timezone format)
   # Examples: Europe/Berlin, America/New_York, Asia/Tokyo
   timezone: "Europe/Berlin"
