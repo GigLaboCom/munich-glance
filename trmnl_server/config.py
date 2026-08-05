@@ -24,6 +24,7 @@ class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 4567
     debug: bool = False
+    log_level: str = "INFO"  # DEBUG surfaces per-request device/telemetry detail
 
     # Paths
     project_root: Path = field(default_factory=_get_project_root)
@@ -101,6 +102,7 @@ class ServerConfig:
             host=loader.get("server", "host", "0.0.0.0"),
             port=int(loader.get("server", "port", 4567)),
             debug=debug_val,
+            log_level=str(loader.get("server", "log_level", "INFO")),
             refresh_time=int(loader.get("device", "refresh_time", 120)),
             setup_api_key=loader.get("device", "api_key", ""),
             setup_friendly_id=loader.get("device", "friendly_id", "munich-glance"),

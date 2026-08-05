@@ -261,11 +261,31 @@ The CLI helps you:
 |----------|-------------|
 | `GET /api/display` | Main TRMNL endpoint - returns current image |
 | `POST /api/log` | Device event logging |
-| `POST /api/battery` | Battery telemetry |
+| `POST /api/battery` | Battery telemetry (MunichGlance extension, not part of the TRMNL protocol) |
 | `GET /api/health` | Health check |
 | `GET /settings` | Current configuration |
 | `GET /settings/plugins` | List registered plugins |
 | `GET /docs` | OpenAPI documentation |
+
+### Device protocol notes
+
+The firmware identifies itself with the **`ID`** header (its MAC address) and
+piggybacks telemetry — `Battery-Voltage`, `RSSI`, `FW-Version`, `Refresh-Rate` —
+onto every request. Requests without `ID` are served normally but are not
+registered as devices. `X-Device-MAC` and `?mac=` work as aliases for custom
+clients.
+
+`POST /api/log` accepts the current firmware payload `{"logs": [...]}`, the older
+`{"log": {"logs_array": [...]}}`, and a flat legacy form. Anything else is answered
+`200 OK` and logged at WARNING with the raw body, so unknown shapes are visible
+instead of silently dropped.
+
+Battery readings are taken from the telemetry headers and from log entries, at most
+one sample per device per 15 minutes. `POST /api/battery` stays available for manual
+reporting; stock firmware never calls it.
+
+Set `LOG_LEVEL=DEBUG` (or `server.log_level` in the config) for per-request device
+detail.
 
 ## Architecture
 

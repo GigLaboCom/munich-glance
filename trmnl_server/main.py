@@ -1,6 +1,7 @@
 """FastAPI application for TRMNL BYOS server."""
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -15,11 +16,29 @@ from trmnl_server.routes import api, settings
 from trmnl_server.services.plugins import register_plugins, schedule_plugins
 from trmnl_server.services.scheduler import start_scheduler, stop_scheduler
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+
+def _configure_logging() -> None:
+    """Set the root log level from LOG_LEVEL or server.log_level (default INFO).
+
+    The device handlers log request detail at DEBUG. With the level hardcoded, the
+    only way to see any of it in a container was to rebuild the image.
+    """
+    level_name = os.getenv("LOG_LEVEL")
+    if not level_name:
+        try:
+            level_name = get_config().log_level
+        except Exception:  # pragma: no cover - config problems surface later
+            level_name = "INFO"
+
+    level = getattr(logging, level_name.strip().upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    logging.getLogger().setLevel(level)
+
+
+_configure_logging()
 logger = logging.getLogger(__name__)
 
 
