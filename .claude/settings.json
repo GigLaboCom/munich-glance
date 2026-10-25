@@ -6,7 +6,6 @@
       "Write",
       "Bash",
       "WebFetch",
-      "mcp__*",
       "WebSearch"
     ],
     "deny": [
